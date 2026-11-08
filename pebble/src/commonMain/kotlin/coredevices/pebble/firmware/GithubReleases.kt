@@ -144,6 +144,38 @@ class GithubReleases(
     )
 
     /**
+     * Fork (consnop): the newest patched build released by consnop/PebbleOS, for the boards in
+     * [PATCHED_REVISIONS]. Its tags are `<upstream tag>-consnop-<patch id>`, which
+     * [ReleaseTagVersion] compares equal to the upstream tag, so besides a higher version this also
+     * offers a different build of the running version (stock, or older patches). Only the newest
+     * release is ever offered, so an older build of the running version never comes back.
+     */
+    suspend fun getLatestPatchedFirmware(watch: WatchInfo): FirmwareUpdateCheckResult {
+        val page = when (val fetched = fetch<List<GithubReleaseDto>>(PATCHED_RELEASES_URL, perPage = PAGE_SIZE)) {
+            is Fetched.Success -> fetched.value
+            Fetched.NotFound -> return FirmwareUpdateCheckResult.UpdateCheckFailed(GENERIC_FAILURE)
+            is Fetched.Failure -> return FirmwareUpdateCheckResult.UpdateCheckFailed(fetched.message)
+        }
+        val runningTag = watch.runningFwVersion.stringVersion.trim()
+        val running = if (watch.runningFwVersion.isRecovery) null else {
+            ReleaseTagVersion.from(runningTag) ?: run {
+                logger.e { "Cannot parse running firmware version '$runningTag'" }
+                return FirmwareUpdateCheckResult.UpdateCheckFailed(GENERIC_FAILURE)
+            }
+        }
+        val newest = page.mapNotNull { release ->
+            val version = ReleaseTagVersion.from(release.tagName) ?: return@mapNotNull null
+            release.verifiedBuildFor(watch.platform.revision)?.let { version to it }
+        }.maxWithOrNull(compareBy<Pair<ReleaseTagVersion, VerifiedBuild>>({ it.first }, { it.second.publishedAt }))
+            ?: return FirmwareUpdateCheckResult.FoundNoUpdate
+        val (version, build) = newest
+        val offer = running == null || version > running ||
+            (version.compareTo(running) == 0 && build.tag != runningTag)
+        if (!offer) return FirmwareUpdateCheckResult.FoundNoUpdate
+        return foundUpdateFor(build) ?: FirmwareUpdateCheckResult.UpdateCheckFailed(GENERIC_FAILURE)
+    }
+
+    /**
      * Which versions are newer than the watch's firmware, or null when its
      * version cannot be compared. Fail closed: with an incomparable running
      * version any offer could be a downgrade or a same-version loop.
@@ -282,6 +314,10 @@ class GithubReleases(
 
     companion object {
         private const val RELEASES_URL = "https://api.github.com/repos/coredevices/PebbleOS/releases"
+
+        // Fork (consnop): patched firmware, built by that repo's pipeline branch for these boards only.
+        private const val PATCHED_RELEASES_URL = "https://api.github.com/repos/consnop/PebbleOS/releases"
+        internal val PATCHED_REVISIONS = setOf("obelix_pvt")
 
         // The first page of GitHub's release list, both tag lines mixed.
         private const val PAGE_SIZE = 20

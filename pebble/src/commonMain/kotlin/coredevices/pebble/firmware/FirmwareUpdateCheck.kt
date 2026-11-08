@@ -105,7 +105,12 @@ class FirmwareUpdateCheck(
         }
         return when (route) {
             Route.UnknownPlatform -> FirmwareUpdateCheckResult.UpdateCheckFailed("Unknown platform")
-            Route.GithubReleases -> githubReleases.getLatestFirmware(watch)
+            // Fork (consnop): boards with patched builds take them, never Core's stock ones.
+            Route.GithubReleases -> if (watch.platform.revision in GithubReleases.PATCHED_REVISIONS) {
+                githubReleases.getLatestPatchedFirmware(watch)
+            } else {
+                githubReleases.getLatestFirmware(watch)
+            }
             Route.Cohorts -> cohorts.getLatestFirmware(watch)
         }
     }
