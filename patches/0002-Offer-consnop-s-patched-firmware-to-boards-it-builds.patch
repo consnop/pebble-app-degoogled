@@ -1,0 +1,221 @@
+From 9c086acdacf7a6ad5e13e50753eb338520cc6f9f Mon Sep 17 00:00:00 2001
+From: consnop <consnop@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:22:15 +0100
+Subject: [PATCH 2/2] Offer consnop's patched firmware to boards it builds for
+
+consnop/PebbleOS's pipeline branch builds Core's releases with extra
+patches and releases them as <upstream tag>-consnop-<patch id>. Watches on
+those boards (obelix_pvt) now check that repo instead of Core's releases,
+with no fallback to stock builds, so an update never drops the patches.
+
+ReleaseTagVersion ignores suffixes, so the patched check offers a build
+whose version is higher, or equal with a different tag: that moves stock
+firmware to the patched build of the same version and picks up new patch
+builds. Only the newest release is considered, so the running build and
+older builds of the same version are never offered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J4cyE5MpWNo2QG1iuNRXKQ
+---
+ .../pebble/firmware/FirmwareUpdateCheck.kt    |   7 +-
+ .../pebble/firmware/GithubReleases.kt         |  36 ++++++
+ .../firmware/GithubReleasesPatchedTest.kt     | 115 ++++++++++++++++++
+ 3 files changed, 157 insertions(+), 1 deletion(-)
+ create mode 100644 pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt
+
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/FirmwareUpdateCheck.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/FirmwareUpdateCheck.kt
+index 4401f39b..a4d98517 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/FirmwareUpdateCheck.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/FirmwareUpdateCheck.kt
+@@ -105,7 +105,12 @@ class FirmwareUpdateCheck(
+         }
+         return when (route) {
+             Route.UnknownPlatform -> FirmwareUpdateCheckResult.UpdateCheckFailed("Unknown platform")
+-            Route.GithubReleases -> githubReleases.getLatestFirmware(watch)
++            // Fork (consnop): boards with patched builds take them, never Core's stock ones.
++            Route.GithubReleases -> if (watch.platform.revision in GithubReleases.PATCHED_REVISIONS) {
++                githubReleases.getLatestPatchedFirmware(watch)
++            } else {
++                githubReleases.getLatestFirmware(watch)
++            }
+             Route.Cohorts -> cohorts.getLatestFirmware(watch)
+         }
+     }
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt
+index 8f053791..9f839916 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt
+@@ -143,6 +143,38 @@ class GithubReleases(
+         val lookedUp: GithubReleaseDto?,
+     )
+ 
++    /**
++     * Fork (consnop): the newest patched build released by consnop/PebbleOS, for the boards in
++     * [PATCHED_REVISIONS]. Its tags are `<upstream tag>-consnop-<patch id>`, which
++     * [ReleaseTagVersion] compares equal to the upstream tag, so besides a higher version this also
++     * offers a different build of the running version (stock, or older patches). Only the newest
++     * release is ever offered, so an older build of the running version never comes back.
++     */
++    suspend fun getLatestPatchedFirmware(watch: WatchInfo): FirmwareUpdateCheckResult {
++        val page = when (val fetched = fetch<List<GithubReleaseDto>>(PATCHED_RELEASES_URL, perPage = PAGE_SIZE)) {
++            is Fetched.Success -> fetched.value
++            Fetched.NotFound -> return FirmwareUpdateCheckResult.UpdateCheckFailed(GENERIC_FAILURE)
++            is Fetched.Failure -> return FirmwareUpdateCheckResult.UpdateCheckFailed(fetched.message)
++        }
++        val runningTag = watch.runningFwVersion.stringVersion.trim()
++        val running = if (watch.runningFwVersion.isRecovery) null else {
++            ReleaseTagVersion.from(runningTag) ?: run {
++                logger.e { "Cannot parse running firmware version '$runningTag'" }
++                return FirmwareUpdateCheckResult.UpdateCheckFailed(GENERIC_FAILURE)
++            }
++        }
++        val newest = page.mapNotNull { release ->
++            val version = ReleaseTagVersion.from(release.tagName) ?: return@mapNotNull null
++            release.verifiedBuildFor(watch.platform.revision)?.let { version to it }
++        }.maxWithOrNull(compareBy<Pair<ReleaseTagVersion, VerifiedBuild>>({ it.first }, { it.second.publishedAt }))
++            ?: return FirmwareUpdateCheckResult.FoundNoUpdate
++        val (version, build) = newest
++        val offer = running == null || version > running ||
++            (version.compareTo(running) == 0 && build.tag != runningTag)
++        if (!offer) return FirmwareUpdateCheckResult.FoundNoUpdate
++        return foundUpdateFor(build) ?: FirmwareUpdateCheckResult.UpdateCheckFailed(GENERIC_FAILURE)
++    }
++
+     /**
+      * Which versions are newer than the watch's firmware, or null when its
+      * version cannot be compared. Fail closed: with an incomparable running
+@@ -283,6 +315,10 @@ class GithubReleases(
+     companion object {
+         private const val RELEASES_URL = "https://api.github.com/repos/coredevices/PebbleOS/releases"
+ 
++        // Fork (consnop): patched firmware, built by that repo's pipeline branch for these boards only.
++        private const val PATCHED_RELEASES_URL = "https://api.github.com/repos/consnop/PebbleOS/releases"
++        internal val PATCHED_REVISIONS = setOf("obelix_pvt")
++
+         // The first page of GitHub's release list, both tag lines mixed.
+         private const val PAGE_SIZE = 20
+         private const val MAX_CHOICES = 5
+diff --git a/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt b/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt
+new file mode 100644
+index 00000000..98d8b26c
+--- /dev/null
++++ b/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt
+@@ -0,0 +1,115 @@
++package coredevices.pebble.firmware
++
++import com.anopticlabs.gravel.firmware.PebbleOsChangelogListSource
++import io.ktor.client.HttpClient
++import io.ktor.client.engine.mock.MockEngine
++import io.ktor.client.engine.mock.respond
++import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
++import io.ktor.client.request.HttpRequestData
++import io.ktor.http.HttpHeaders
++import io.ktor.http.HttpStatusCode
++import io.ktor.http.headersOf
++import io.ktor.serialization.kotlinx.json.json
++import io.rebble.libpebblecommon.connection.FirmwareUpdateCheckResult
++import io.rebble.libpebblecommon.metadata.WatchHardwarePlatform.CORE_OBELIX_PVT
++import kotlinx.coroutines.test.runTest
++import kotlinx.serialization.json.Json
++import kotlin.test.Test
++import kotlin.test.assertContains
++import kotlin.test.assertEquals
++import kotlin.test.assertIs
++
++/**
++ * Pins the fork's patched-firmware feed: consnop/PebbleOS tags are `<upstream tag>-consnop-<patch id>`,
++ * which compare equal to the upstream version, so a different build of the running version is offered
++ * but the running build, or an older build of its version, never is.
++ */
++class GithubReleasesPatchedTest {
++
++    private val board = "obelix_pvt"
++
++    private fun release(tag: String, ageDays: Int, prerelease: Boolean = false, boards: List<String> = listOf(board)) =
++        releaseJson(tag, ageDays, boards.map { normalAsset(it, tag, "sha256:" + "c".repeat(64), 100) }, prerelease = prerelease)
++
++    private class Feed(body: String) {
++        val requests = mutableListOf<HttpRequestData>()
++        val client = HttpClient(MockEngine { request ->
++            requests += request
++            check(request.url.encodedPath == PATCHED_PATH) { "unexpected request to ${request.url}" }
++            respond(body, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
++        }) {
++            install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
++        }
++        val checker = GithubReleases(client, FirmwareArtifactExpectations(), PebbleOsChangelogListSource(client))
++    }
++
++    private suspend fun check(running: String, vararg releases: String, isRecovery: Boolean = false) =
++        Feed(releaseList(*releases)).checker.getLatestPatchedFirmware(testWatchInfo(CORE_OBELIX_PVT, running, isRecovery))
++
++    @Test
++    fun offersThePatchedBuildOfTheRunningStockVersion() = runTest {
++        val update = assertIs<FirmwareUpdateCheckResult.FoundUpdate>(check("v4.45.0", release("v4.45.0-consnop-bbbbbbbb", 1)))
++        assertContains(update.url, "normal_${board}_v4.45.0-consnop-bbbbbbbb.pbz")
++    }
++
++    @Test
++    fun neverReoffersTheRunningBuild() = runTest {
++        assertEquals(
++            FirmwareUpdateCheckResult.FoundNoUpdate,
++            check("v4.45.0-consnop-bbbbbbbb", release("v4.45.0-consnop-bbbbbbbb", 1)),
++        )
++    }
++
++    @Test
++    fun neverOffersAnOlderBuildOfTheRunningVersion() = runTest {
++        assertEquals(
++            FirmwareUpdateCheckResult.FoundNoUpdate,
++            check("v4.45.0-consnop-bbbbbbbb", release("v4.45.0-consnop-bbbbbbbb", 1), release("v4.45.0-consnop-aaaaaaaa", 3)),
++        )
++    }
++
++    @Test
++    fun offersANewerBuildOfTheRunningVersion() = runTest {
++        val update = assertIs<FirmwareUpdateCheckResult.FoundUpdate>(
++            check("v4.45.0-consnop-aaaaaaaa", release("v4.45.0-consnop-bbbbbbbb", 1), release("v4.45.0-consnop-aaaaaaaa", 3)),
++        )
++        assertContains(update.url, "v4.45.0-consnop-bbbbbbbb")
++    }
++
++    @Test
++    fun prefersAHigherVersionAndSkipsUnusableReleases() = runTest {
++        val update = assertIs<FirmwareUpdateCheckResult.FoundUpdate>(
++            check(
++                "v4.45.0",
++                release("v4.47.0-consnop-dddddddd", 0, prerelease = true),
++                release("v4.46.1-consnop-eeeeeeee", 0, boards = listOf("asterix")),
++                release("v4.46.0-consnop-cccccccc", 2),
++                release("v4.45.0-consnop-bbbbbbbb", 5),
++            ),
++        )
++        assertContains(update.url, "v4.46.0-consnop-cccccccc")
++    }
++
++    @Test
++    fun offersNothingOlderThanTheRunningVersion() = runTest {
++        assertEquals(FirmwareUpdateCheckResult.FoundNoUpdate, check("v4.46.0", release("v4.45.0-consnop-bbbbbbbb", 1)))
++    }
++
++    @Test
++    fun recoveryAlwaysGetsTheNewestBuild() = runTest {
++        assertIs<FirmwareUpdateCheckResult.FoundUpdate>(
++            check("v4.9.142", release("v4.45.0-consnop-bbbbbbbb", 1), isRecovery = true),
++        )
++    }
++
++    @Test
++    fun onlyThePatchedFeedIsAsked() = runTest {
++        val feed = Feed(releaseList(release("v4.45.0-consnop-bbbbbbbb", 1)))
++        feed.checker.getLatestPatchedFirmware(testWatchInfo(CORE_OBELIX_PVT, "v4.45.0"))
++        assertEquals(listOf(PATCHED_PATH), feed.requests.map { it.url.encodedPath })
++    }
++
++    private companion object {
++        const val PATCHED_PATH = "/repos/consnop/PebbleOS/releases"
++    }
++}
+-- 
+2.55.0
+
