@@ -1,0 +1,189 @@
+name: Patched Gravel
+
+# Applies patches/*.patch to an upstream Gravel release tag, builds the release APK unsigned
+# (Gravel's build leaves release unsigned when no keystore is present), and publishes it as a
+# release of this repo named <upstream tag>-consnop-<patch id>. Signing happens elsewhere.
+
+on:
+  schedule:
+    - cron: "37 4 * * *"   # daily: picks up new upstream releases
+  push:
+    branches: [pipeline]
+    paths: ["patches/**", "pipeline.env", ".github/workflows/gravel.yml"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (default: per pipeline.env)"
+        required: false
+      force:
+        description: "Rebuild even if that release already exists"
+        type: boolean
+        default: false
+
+concurrency:
+  group: gravel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: david-cant-code/pebble-app-degoogled
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      release: ${{ steps.plan.outputs.release }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          . ./pipeline.env
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          else
+            tags=$(gh api --paginate "repos/$UPSTREAM/tags?per_page=100" --jq '.[].name' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+            if [ "$TRACK" != latest ]; then
+              tags=$(printf '%s\n' "$tags" | grep -E "^$(printf '%s' "$TRACK" | sed 's/\./\\./g')" || true)
+            fi
+            tag=$(printf '%s\n' "$tags" | sort -V | tail -1)
+          fi
+          [ -n "$tag" ] || { echo "::error::no upstream tag matches TRACK=$TRACK"; exit 1; }
+
+          patch_id=$(cat patches/*.patch | sha256sum | cut -c1-8)
+          release="${tag}-consnop-${patch_id}"
+
+          build=true
+          if [ "${FORCE:-false}" != true ] && gh release view "$release" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+            echo "Release $release already exists, nothing to do."
+          fi
+          { echo "tag=$tag"; echo "release=$release"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
+          echo "### $release (upstream \`$tag\`, build: $build)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      patches_applied: ${{ steps.am.outcome == 'success' }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      # Full history: Gravel's versionCode is the commit count, its versionName `git describe`.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          path: src
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply patches
+        id: am
+        working-directory: src
+        run: |
+          git config user.name "consnop pipeline"
+          git config user.email "consnop@users.noreply.github.com"
+          git am --3way ../pipeline/patches/*.patch
+          git log --oneline -n "$(ls ../pipeline/patches/*.patch | wc -l)"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('src/gradle/**', 'src/gradlew*', 'src/gradle.properties', 'src/*.gradle*') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build
+        working-directory: src
+        run: ./gradlew :androidApp:assembleRelease --no-daemon
+
+      - name: Collect
+        working-directory: src
+        run: |
+          apk=androidApp/build/outputs/apk/release/androidApp-release-unsigned.apk
+          aapt2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n 1)"
+          "$aapt2" dump badging "$apk" | head -n 1 | tee ../badging.txt
+          mkdir ../out
+          cp "$apk" "../out/gravel-${RELEASE}-unsigned.apk"
+          sha256sum "../out/gravel-${RELEASE}-unsigned.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: |
+            out
+            badging.txt
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: dl
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE: ${{ needs.plan.outputs.release }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Upstream Gravel [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG) with these patches:"
+            echo
+            for p in patches/*.patch; do echo "- $(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | head -1)"; done
+            echo
+            echo "**Unsigned.** Android won't install this; the signed build is published separately."
+            echo
+            echo '```'; cat dl/badging.txt; echo '```'
+          } > notes.md
+          gh release delete "$RELEASE" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE" dl/out/*.apk -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$RELEASE (unsigned)" --notes-file notes.md
+
+  conflict:
+    needs: [plan, build]
+    if: failure() && needs.build.outputs.patches_applied != 'true' && needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Patches don't apply to $TAG"
+          if gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[].number' | grep -q .; then
+            echo "Issue already open."; exit 0
+          fi
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body \
+            "\`git am\` failed applying \`patches/\` to upstream Gravel \`$TAG\`. Run: $RUN_URL
+
+          Rebase the patches onto \`$TAG\`, regenerate them with \`git format-patch\`, and push to the \`pipeline\` branch."
