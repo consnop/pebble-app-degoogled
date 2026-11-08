@@ -293,6 +293,11 @@ enum class QuicklaunchWatchPref(
     QlBack("qlBack", "Quick Launch: Hold Back", QuickLaunchSetting(true, QUIET_TIME_TOGGLE_UUID)),
     QlComboBackUp("qlComboBackUp", "Quick Launch: Hold Combo Back+Up", QuickLaunchSetting(false, null)),
     QlComboUpDown("qlComboUpDown", "Quick Launch: Hold Combo Up+Down", QuickLaunchSetting(false, null)),
+    // Fork: the other four two-button combos, in firmware that has them (consnop/PebbleOS).
+    QlComboBackSelect("qlComboBackSelect", "Quick Launch: Hold Combo Back+Select", QuickLaunchSetting(false, null)),
+    QlComboBackDown("qlComboBackDown", "Quick Launch: Hold Combo Back+Down", QuickLaunchSetting(false, null)),
+    QlComboUpSelect("qlComboUpSelect", "Quick Launch: Hold Combo Up+Select", QuickLaunchSetting(false, null)),
+    QlComboSelectDown("qlComboSelectDown", "Quick Launch: Hold Combo Select+Down", QuickLaunchSetting(false, null)),
     QlSingleClickUp(
         "qlSingleClickUp",
         "Quick Launch: Tap Up",
