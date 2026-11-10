@@ -1,7 +1,7 @@
 From 5c0fb940a6ea105d9fb6a39eba8959826631216e Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 15:01:19 +0100
-Subject: [PATCH 3/4] Read the patched firmware feed file instead of the
+Subject: [PATCH 3/5] Read the patched firmware feed file instead of the
  releases API
 
 The patched firmware check listed consnop/PebbleOS's releases through

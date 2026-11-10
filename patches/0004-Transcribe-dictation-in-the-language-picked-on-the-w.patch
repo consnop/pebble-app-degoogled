@@ -1,7 +1,7 @@
 From c401a4736b85805c18d9917f7dbdad9f2f60f81c Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 15:15:47 +0100
-Subject: [PATCH 4/4] Transcribe dictation in the language picked on the watch
+Subject: [PATCH 4/5] Transcribe dictation in the language picked on the watch
 
 consnop's patched PebbleOS lets the dictation screen pick the spoken
 language (SK / EN / DE). It sends the ISO 639-1 code with the session

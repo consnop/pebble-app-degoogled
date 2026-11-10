@@ -1,0 +1,131 @@
+From 0a4391ef3479abef1c4bf0d726bac7f8e3696b36 Mon Sep 17 00:00:00 2001
+From: consnop <consnop@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:42:44 +0100
+Subject: [PATCH 5/5] Show only the patched build in the firmware picker on
+ patched boards
+
+The "Choose a PebbleOS build" picker still listed Core's releases through
+api.github.com on obelix_pvt, so behind a shared IP it stopped at "rate
+limited" and could not install the patched build the update check had
+just offered. On boards in PATCHED_REVISIONS it now offers exactly what
+the update check does: the feed's build, preselected, or nothing newer,
+or the check's failure. It also can no longer list a stock build that
+would drop the patches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J4cyE5MpWNo2QG1iuNRXKQ
+---
+ .../pebble/firmware/GithubReleases.kt         | 15 +++++++++++
+ .../GithubReleasesBuildChoicesTest.kt         |  4 +--
+ .../firmware/GithubReleasesPatchedTest.kt     | 27 +++++++++++++++++++
+ 3 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt
+index e5e86fdd..c4b8e3a4 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/firmware/GithubReleases.kt
+@@ -82,6 +82,7 @@ class GithubReleases(
+      * page and leaves the builds unlabeled.
+      */
+     suspend fun getBuildChoices(watch: WatchInfo): FirmwareBuildChoicesResult {
++        if (watch.platform.revision in PATCHED_REVISIONS) return getPatchedBuildChoices(watch)
+         val list = when (val result = changelogList.fetch()) {
+             is ChangelogListResult.Success -> result.list
+             ChangelogListResult.RateLimited -> return FirmwareBuildChoicesResult.Failed(RATE_LIMITED_FAILURE)
+@@ -146,6 +147,20 @@ class GithubReleases(
+         val lookedUp: GithubReleaseDto?,
+     )
+ 
++    /**
++     * Fork (consnop): on boards with patched builds the picker offers only what the update check
++     * would, so it never lists a stock build that drops the patches.
++     */
++    private suspend fun getPatchedBuildChoices(watch: WatchInfo): FirmwareBuildChoicesResult =
++        when (val result = getLatestPatchedFirmware(watch)) {
++            is FirmwareUpdateCheckResult.FoundUpdate -> FirmwareBuildChoicesResult.Success(
++                listOf(FirmwareBuildChoice(result, ChangelogListing.Unknown, isRecommended = true)),
++                listCheckedAt = null,
++            )
++            is FirmwareUpdateCheckResult.UpdateCheckFailed -> FirmwareBuildChoicesResult.Failed(result.error)
++            else -> FirmwareBuildChoicesResult.Success(emptyList(), listCheckedAt = null)
++        }
++
+     /**
+      * Fork (consnop): the newest patched build released by consnop/PebbleOS, for the boards in
+      * [PATCHED_REVISIONS], read from the `firmware-feed.json` its pipeline attaches to each release.
+diff --git a/pebble/src/commonTest/kotlin/com/anopticlabs/gravel/firmware/GithubReleasesBuildChoicesTest.kt b/pebble/src/commonTest/kotlin/com/anopticlabs/gravel/firmware/GithubReleasesBuildChoicesTest.kt
+index e8268529..ab5efd07 100644
+--- a/pebble/src/commonTest/kotlin/com/anopticlabs/gravel/firmware/GithubReleasesBuildChoicesTest.kt
++++ b/pebble/src/commonTest/kotlin/com/anopticlabs/gravel/firmware/GithubReleasesBuildChoicesTest.kt
+@@ -20,7 +20,6 @@ import io.rebble.libpebblecommon.metadata.WatchHardwarePlatform.CORE_ASTERIX
+ import io.rebble.libpebblecommon.metadata.WatchHardwarePlatform.CORE_GETAFIX_DVT
+ import io.rebble.libpebblecommon.metadata.WatchHardwarePlatform.CORE_GETAFIX_EVT
+ import io.rebble.libpebblecommon.metadata.WatchHardwarePlatform.CORE_OBELIX_DVT
+-import io.rebble.libpebblecommon.metadata.WatchHardwarePlatform.CORE_OBELIX_PVT
+ import kotlinx.coroutines.test.runTest
+ import kotlinx.io.IOException
+ import kotlin.test.Test
+@@ -248,7 +247,8 @@ class GithubReleasesBuildChoicesTest {
+         val offer = assertIs<FirmwareUpdateCheckResult.FoundUpdate>(
+             github(page = page).checker(expectations).getLatestFirmware(testWatchInfo(CORE_ASTERIX, "v4.36.0")),
+         )
+-        for (platform in listOf(CORE_OBELIX_PVT, CORE_OBELIX_DVT, CORE_GETAFIX_EVT, CORE_GETAFIX_DVT)) {
++        // obelix_pvt is left out: the fork's patched feed serves it (GithubReleasesPatchedTest).
++        for (platform in listOf(CORE_OBELIX_DVT, CORE_GETAFIX_EVT, CORE_GETAFIX_DVT)) {
+             assertEquals(5, choices(github(page = page), "v4.36.0", platform, expectations = expectations).shown().size)
+         }
+         assertNotNull(expectations.lookup(offer.url))
+diff --git a/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt b/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt
+index 9e44ffed..a6b7aeda 100644
+--- a/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt
++++ b/pebble/src/commonTest/kotlin/coredevices/pebble/firmware/GithubReleasesPatchedTest.kt
+@@ -1,5 +1,6 @@
+ package coredevices.pebble.firmware
+ 
++import com.anopticlabs.gravel.firmware.FirmwareBuildChoicesResult
+ import com.anopticlabs.gravel.firmware.PebbleOsChangelogListSource
+ import io.ktor.client.HttpClient
+ import io.ktor.client.engine.mock.MockEngine
+@@ -17,6 +18,7 @@ import kotlinx.serialization.json.Json
+ import kotlin.test.Test
+ import kotlin.test.assertEquals
+ import kotlin.test.assertIs
++import kotlin.test.assertTrue
+ 
+ /**
+  * Pins the fork's patched-firmware feed: consnop/PebbleOS attaches `firmware-feed.json` to each
+@@ -146,6 +148,31 @@ class GithubReleasesPatchedTest {
+         assertEquals(listOf(FEED_URL), feed.requests.map { it.url.toString() })
+     }
+ 
++    @Test
++    fun thePickerOffersOnlyThePatchedBuild() = runTest {
++        val feed = Feed(feed("v4.46.0-consnop-cccccccc"))
++        val choices = assertIs<FirmwareBuildChoicesResult.Success>(
++            feed.checker.getBuildChoices(testWatchInfo(CORE_OBELIX_PVT, "v4.45.0")),
++        )
++        val choice = choices.builds.single()
++        assertTrue(choice.isRecommended, "the only build must be preselected")
++        assertTrue(choice.update.url.endsWith("/v4.46.0-consnop-cccccccc/normal_${board}_v4.46.0-consnop-cccccccc.pbz"))
++        assertEquals(listOf(FEED_URL), feed.requests.map { it.url.toString() }, "the picker must not ask the REST API")
++    }
++
++    @Test
++    fun thePickerShowsNothingNewerAndFeedFailures() = runTest {
++        assertEquals(
++            emptyList(),
++            assertIs<FirmwareBuildChoicesResult.Success>(
++                Feed(feed("v4.45.0-consnop-bbbbbbbb")).checker.getBuildChoices(testWatchInfo(CORE_OBELIX_PVT, "v4.45.0-consnop-bbbbbbbb")),
++            ).builds,
++        )
++        assertIs<FirmwareBuildChoicesResult.Failed>(
++            Feed("Not Found", HttpStatusCode.NotFound).checker.getBuildChoices(testWatchInfo(CORE_OBELIX_PVT, "v4.45.0")),
++        )
++    }
++
+     private companion object {
+         const val FEED_URL = "https://github.com/consnop/PebbleOS/releases/latest/download/firmware-feed.json"
+     }
+-- 
+2.55.0
+
