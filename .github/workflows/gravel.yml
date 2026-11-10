@@ -142,6 +142,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -166,6 +167,16 @@ jobs:
           gh release delete "$RELEASE" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$RELEASE" dl/out/*.apk -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$RELEASE (unsigned)" --notes-file notes.md
+      # A rebase that builds and releases resolves the conflict issue for this tag.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE: ${{ needs.plan.outputs.release }}
+        run: |
+          title="Patches don't apply to $TAG"
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number,title --jq ".[] | select(.title == \"$title\") | .number"); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Built and released as $RELEASE."
+          done
 
   conflict:
     needs: [plan, build]
