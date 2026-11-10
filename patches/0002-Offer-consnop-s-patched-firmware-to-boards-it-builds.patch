@@ -1,7 +1,7 @@
-From 9c086acdacf7a6ad5e13e50753eb338520cc6f9f Mon Sep 17 00:00:00 2001
+From 0ec06e1b0273f75b694912aca80e9c0b763d2a23 Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 22:22:15 +0100
-Subject: [PATCH 2/2] Offer consnop's patched firmware to boards it builds for
+Subject: [PATCH 2/3] Offer consnop's patched firmware to boards it builds for
 
 consnop/PebbleOS's pipeline branch builds Core's releases with extra
 patches and releases them as <upstream tag>-consnop-<patch id>. Watches on
