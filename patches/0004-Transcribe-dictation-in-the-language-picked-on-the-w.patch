@@ -1,0 +1,505 @@
+From c401a4736b85805c18d9917f7dbdad9f2f60f81c Mon Sep 17 00:00:00 2001
+From: consnop <consnop@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:15:47 +0100
+Subject: [PATCH 4/4] Transcribe dictation in the language picked on the watch
+
+consnop's patched PebbleOS lets the dictation screen pick the spoken
+language (SK / EN / DE). It sends the ISO 639-1 code with the session
+setup as voice attribute 0x40, and sends voice command 0x40 (session id
+plus the same attribute) when the pick changes during the recording.
+
+VoiceService reads both; the coordinator keeps the session's language,
+updated by changes for its session id until the session ends, and hands
+the provider a getter it reads once the recording has ended.
+TranscriptionProvider gains an overload taking that getter, defaulting to
+the old call, so providers that ignore the language are unchanged. The
+hybrid path (local whisper and the self-hosted server) uses the watch's
+language over the spoken language setting; Rebble's ASR and the local
+fallback in the Rebble modes keep their own handling.
+
+Firmware without the patch sends neither, so the setting applies as
+before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J4cyE5MpWNo2QG1iuNRXKQ
+---
+ .../audio/VoiceSessionCoordinator.kt          | 15 +++-
+ .../audio/VoiceSessionManager.kt              |  1 +
+ .../rebble/libpebblecommon/packets/Voice.kt   | 24 ++++++
+ .../libpebblecommon/services/VoiceService.kt  | 26 ++++++-
+ .../voice/TranscriptionProvider.kt            | 13 ++++
+ .../audio/VoiceSessionCoordinatorTest.kt      | 74 ++++++++++++++++++-
+ .../packets/VoiceLanguagePacketTest.kt        | 65 ++++++++++++++++
+ .../pebble/services/HybridTranscription.kt    | 14 +++-
+ .../coredevices/pebble/services/STTRouter.kt  | 13 +++-
+ 9 files changed, 237 insertions(+), 8 deletions(-)
+ create mode 100644 libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/packets/VoiceLanguagePacketTest.kt
+
+diff --git a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinator.kt b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinator.kt
+index 4df893f7..25cca3dc 100644
+--- a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinator.kt
++++ b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinator.kt
+@@ -18,6 +18,7 @@ import io.rebble.libpebblecommon.voice.TranscriptionWord
+ import io.rebble.libpebblecommon.voice.boundedForProtocol
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.CoroutineStart
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.async
+@@ -27,6 +28,7 @@ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.emptyFlow
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.receiveAsFlow
+ import kotlinx.coroutines.launch
+@@ -90,6 +92,7 @@ internal class VoiceSessionCoordinator(
+     private val watchAppCaptures: WatchAppCaptures? = null,
+     private val linkPace: StateFlow<LinkPace> = MutableStateFlow(LinkPace.Unknown),
+     private val requestFastLink: () -> Unit = {},
++    private val languageUpdates: Flow<VoiceService.LanguageUpdate> = emptyFlow(),
+ ) {
+     companion object {
+         private val logger = Logger.withTag("VoiceSession")
+@@ -154,6 +157,12 @@ internal class VoiceSessionCoordinator(
+             onSessionEnded(request, result)
+         }
+ 
++        // Gravel: the watch can change the language while recording. This collector starts before the
++        // setup reply, which is what lets the watch record, so no change can come before it.
++        val language = MutableStateFlow(request.language)
++        val languageWatch = scope.launch(start = CoroutineStart.UNDISPATCHED) {
++            languageUpdates.collect { if (it.sessionId == request.sessionId) language.value = it.language }
++        }
+         try {
+             // The collector and the decode are children of this session's job,
+             // so a superseding session cancels both with it.
+@@ -179,7 +188,9 @@ internal class VoiceSessionCoordinator(
+                         if (captures != null) {
+                             captures.capture(encoderInfo, frames.receiveAsFlow()).asAnswer()
+                         } else {
+-                            provider.transcribe(encoderInfo, frames.receiveAsFlow(), isNotificationReply(request))
++                            provider.transcribe(encoderInfo, frames.receiveAsFlow(), isNotificationReply(request)) {
++                                language.value
++                            }
+                         }
+                     } catch (e: CancellationException) {
+                         throw e
+@@ -223,6 +234,8 @@ internal class VoiceSessionCoordinator(
+                 end(TranscriptionResult.Failed)
+             }
+             throw e
++        } finally {
++            languageWatch.cancel()
+         }
+     }
+ 
+diff --git a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionManager.kt b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionManager.kt
+index 24e3b72c..96c96998 100644
+--- a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionManager.kt
++++ b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionManager.kt
+@@ -123,6 +123,7 @@ class VoiceSessionManager(
+         watchAppCaptures = watchAppCaptures.captures,
+         linkPace = linkPace.pace,
+         requestFastLink = linkPace::requestFast,
++        languageUpdates = voiceService.languageUpdates,
+         onSessionStarted = { request ->
+             _currentSession.value = CurrentSession(request, CompletableDeferred())
+         },
+diff --git a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/packets/Voice.kt b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/packets/Voice.kt
+index be8433e0..e8d863d2 100644
+--- a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/packets/Voice.kt
++++ b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/packets/Voice.kt
+@@ -27,6 +27,9 @@ sealed class OutgoingVoicePacket(command: VoiceCommand) :
+ enum class VoiceCommand(val value: UByte) {
+     SessionSetup(0x01u),
+     DictationResult(0x02u),
++
++    /** Gravel: consnop's patched firmware, the spoken language changed during a session. */
++    SessionLanguage(0x40u),
+ }
+ 
+ class Word(confidence: UByte = 0u, data: String = "") : StructMappable() {
+@@ -51,6 +54,9 @@ enum class VoiceAttributeType(val value: UByte) {
+     SpeexEncoderInfo(0x01u),
+     Transcription(0x02u),
+     AppUuid(0x03u),
++
++    /** Gravel: consnop's patched firmware, the spoken language as a two-letter ISO 639-1 code. */
++    Language(0x40u),
+ }
+ 
+ open class VoiceAttribute(id: UByte = 0u, content: StructMappable? = null) : StructMappable() {
+@@ -101,6 +107,21 @@ class SessionSetupCommand : IncomingVoicePacket() {
+     }
+ }
+ 
++/**
++ * Gravel: consnop's patched firmware sends this when the language picked on the dictation screen
++ * changes while the session's recording is open. Little endian.
++ */
++class SessionLanguageCommand : IncomingVoicePacket() {
++    val sessionId = SUShort(m, endianness = Endian.Little)
++    val attributeCount = SUByte(m)
++    val attributes = SFixedList(m, 0) {
++        VoiceAttribute()
++    }
++    init {
++        attributes.linkWithCount(attributeCount)
++    }
++}
++
+ enum class SessionType(val value: UByte) {
+     Dictation(0x01u),
+     Command(0x02u),
+@@ -132,4 +153,7 @@ fun voicePacketsRegister() {
+     PacketRegistry.register(ProtocolEndpoint.VOICE_CONTROL, VoiceCommand.SessionSetup.value) {
+         SessionSetupCommand()
+     }
++    PacketRegistry.register(ProtocolEndpoint.VOICE_CONTROL, VoiceCommand.SessionLanguage.value) {
++        SessionLanguageCommand()
++    }
+ }
+\ No newline at end of file
+diff --git a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/services/VoiceService.kt b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/services/VoiceService.kt
+index 2f3b4859..2fdecc97 100644
+--- a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/services/VoiceService.kt
++++ b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/services/VoiceService.kt
+@@ -2,6 +2,7 @@ package io.rebble.libpebblecommon.services
+ 
+ import io.rebble.libpebblecommon.connection.PebbleProtocolHandler
+ import io.rebble.libpebblecommon.packets.OutgoingVoicePacket
++import io.rebble.libpebblecommon.packets.SessionLanguageCommand
+ import io.rebble.libpebblecommon.packets.SessionSetupCommand
+ import io.rebble.libpebblecommon.packets.SessionType
+ import io.rebble.libpebblecommon.packets.VoiceAttribute
+@@ -10,6 +11,7 @@ import io.rebble.libpebblecommon.util.DataBuffer
+ import io.rebble.libpebblecommon.voice.VoiceEncoderInfo
+ import kotlinx.coroutines.flow.filterIsInstance
+ import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.mapNotNull
+ import kotlin.uuid.Uuid
+ 
+ class VoiceService(private val protocolHandler: PebbleProtocolHandler) : ProtocolService {
+@@ -34,10 +36,18 @@ class VoiceService(private val protocolHandler: PebbleProtocolHandler) : Protoco
+                 sessionType = SessionType.entries.first {
+                         type -> type.value == it.sessionType.get()
+                 },
+-                encoderInfo = VoiceEncoderInfo.fromProtocol(it.attributes)
++                encoderInfo = VoiceEncoderInfo.fromProtocol(it.attributes),
++                language = languageOf(it.attributes),
+             )
+         }
+ 
++    /** Gravel: language changes the patched firmware sends while a session's recording is open. */
++    val languageUpdates = protocolHandler.inboundMessages
++        .filterIsInstance<SessionLanguageCommand>()
++        .mapNotNull { command ->
++            languageOf(command.attributes)?.let { LanguageUpdate(command.sessionId.get().toInt(), it) }
++        }
++
+     suspend fun send(packet: OutgoingVoicePacket) {
+         protocolHandler.send(packet)
+     }
+@@ -47,5 +57,19 @@ class VoiceService(private val protocolHandler: PebbleProtocolHandler) : Protoco
+         val sessionId: Int,
+         val sessionType: SessionType,
+         val encoderInfo: VoiceEncoderInfo?,
++        /** Gravel: the language picked on the watch, an ISO 639-1 code; null lets the recognizer detect it. */
++        val language: String? = null,
+     )
++
++    data class LanguageUpdate(val sessionId: Int, val language: String)
++
++    companion object {
++        /** The language attribute's code, or null when absent or not two ASCII letters. */
++        internal fun languageOf(attributes: List<VoiceAttribute>): String? {
++            val data = attributes.firstOrNull { it.id.get() == VoiceAttributeType.Language.value }
++                ?.content?.get() ?: return null
++            if (data.size != 2 || !data.all { it.toInt().toChar().isLetter() && it < 0x80u }) return null
++            return data.joinToString("") { it.toInt().toChar().lowercase() }
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/voice/TranscriptionProvider.kt b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/voice/TranscriptionProvider.kt
+index 5eeab16c..d286b540 100644
+--- a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/voice/TranscriptionProvider.kt
++++ b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/voice/TranscriptionProvider.kt
+@@ -9,6 +9,19 @@ interface TranscriptionProvider {
+         audioFrames: Flow<UByteArray>,
+         isNotificationReply: Boolean
+     ): TranscriptionResult
++
++    /**
++     * Gravel: [transcribe] in the language the watch picked, when it sent one. [spokenLanguage] is an
++     * ISO 639-1 code or null; it can change while the recording is open, so read it only once
++     * [audioFrames] has ended.
++     */
++    suspend fun transcribe(
++        encoderInfo: VoiceEncoderInfo,
++        audioFrames: Flow<UByteArray>,
++        isNotificationReply: Boolean,
++        spokenLanguage: () -> String?,
++    ): TranscriptionResult = transcribe(encoderInfo, audioFrames, isNotificationReply)
++
+     suspend fun canServeSession(): Boolean
+ }
+ 
+diff --git a/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinatorTest.kt b/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinatorTest.kt
+index d4aba072..640970c6 100644
+--- a/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinatorTest.kt
++++ b/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/connection/endpointmanager/audio/VoiceSessionCoordinatorTest.kt
+@@ -75,14 +75,28 @@ class VoiceSessionCoordinatorTest {
+         /** Thrown by the provider once it has read the recording, when set. */
+         var failure: Exception? = null
+ 
++        /** Language changes the watch sends during a recording, fed by the test. */
++        val languageUpdates = MutableSharedFlow<VoiceService.LanguageUpdate>()
++
++        /** The language each provider call read once its recording had ended. */
++        val languages = mutableListOf<String?>()
++
+         private val provider = object : TranscriptionProvider {
+             override suspend fun canServeSession(): Boolean = serve.also { serveChecks++ }
+             override suspend fun transcribe(
+                 encoderInfo: VoiceEncoderInfo,
+                 audioFrames: Flow<UByteArray>,
+                 isNotificationReply: Boolean,
++            ): TranscriptionResult = transcribe(encoderInfo, audioFrames, isNotificationReply) { null }
++
++            override suspend fun transcribe(
++                encoderInfo: VoiceEncoderInfo,
++                audioFrames: Flow<UByteArray>,
++                isNotificationReply: Boolean,
++                spokenLanguage: () -> String?,
+             ): TranscriptionResult {
+                 val received = audioFrames.toList()
++                languages += spokenLanguage()
+                 failure?.let { throw it }
+                 val deferred = CompletableDeferred<TranscriptionResult>()
+                 calls += received.size to deferred
+@@ -121,6 +135,7 @@ class VoiceSessionCoordinatorTest {
+             watchAppCaptures = captureHandler,
+             linkPace = pace,
+             requestFastLink = { fastLinkRequests++ },
++            languageUpdates = languageUpdates,
+         )
+ 
+         private fun describe(result: TranscriptionResult) = when (result) {
+@@ -145,8 +160,10 @@ class VoiceSessionCoordinatorTest {
+         fun collectors(id: UShort) = sharedFor(id).subscriptionCount.value
+     }
+ 
+-    private fun request(id: Int, app: Uuid = appA, encoderInfo: VoiceEncoderInfo? = speex) =
+-        VoiceService.SessionSetupRequest(appUuid = app, sessionId = id, sessionType = SessionType.Dictation, encoderInfo = encoderInfo)
++    private fun request(id: Int, app: Uuid = appA, encoderInfo: VoiceEncoderInfo? = speex, language: String? = null) =
++        VoiceService.SessionSetupRequest(
++            appUuid = app, sessionId = id, sessionType = SessionType.Dictation, encoderInfo = encoderInfo, language = language,
++        )
+ 
+     private fun TestScope.harness(): Harness {
+         val h = Harness(this)
+@@ -155,6 +172,59 @@ class VoiceSessionCoordinatorTest {
+         return h
+     }
+ 
++    @Test
++    fun theProviderGetsTheSetupLanguage() = runTest {
++        val h = harness()
++        h.setupRequests.emit(request(1, language = "sk"))
++        runCurrent()
++        h.frame(1u); h.endRecording(1u)
++        runCurrent()
++        assertEquals(listOf<String?>("sk"), h.languages)
++    }
++
++    @Test
++    fun aChangeDuringTheRecordingWinsAndOtherSessionsChangesDont() = runTest {
++        val h = harness()
++        h.setupRequests.emit(request(1, language = "en"))
++        runCurrent()
++        h.frame(1u)
++        h.languageUpdates.emit(VoiceService.LanguageUpdate(sessionId = 1, language = "de"))
++        h.languageUpdates.emit(VoiceService.LanguageUpdate(sessionId = 2, language = "sk"))
++        runCurrent()
++        h.endRecording(1u)
++        runCurrent()
++        assertEquals(listOf<String?>("de"), h.languages)
++    }
++
++    @Test
++    fun withoutALanguageTheProviderDetectsIt() = runTest {
++        val h = harness()
++        h.setupRequests.emit(request(1))
++        runCurrent()
++        h.endRecording(1u)
++        runCurrent()
++        assertEquals(listOf<String?>(null), h.languages)
++    }
++
++    @Test
++    fun aSessionsLanguageDoesNotCarryIntoTheNext() = runTest {
++        val h = harness()
++        h.setupRequests.emit(request(1, language = "en"))
++        runCurrent()
++        h.languageUpdates.emit(VoiceService.LanguageUpdate(sessionId = 1, language = "de"))
++        h.endRecording(1u)
++        runCurrent()
++        h.calls.single().second.complete(TranscriptionResult.Success(words))
++        runCurrent()
++        assertEquals(0, h.languageUpdates.subscriptionCount.value, "an ended session stops listening")
++
++        h.setupRequests.emit(request(2, language = "sk"))
++        runCurrent()
++        h.endRecording(2u)
++        runCurrent()
++        assertEquals(listOf<String?>("de", "sk"), h.languages)
++    }
++
+     @Test
+     fun resultInsideTheDeadlineIsDeliveredAsIs() = runTest {
+         val h = harness()
+diff --git a/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/packets/VoiceLanguagePacketTest.kt b/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/packets/VoiceLanguagePacketTest.kt
+new file mode 100644
+index 00000000..5f2cdebd
+--- /dev/null
++++ b/libpebble3/src/commonTest/kotlin/io/rebble/libpebblecommon/packets/VoiceLanguagePacketTest.kt
+@@ -0,0 +1,65 @@
++package io.rebble.libpebblecommon.packets
++
++import assertIs
++import io.rebble.libpebblecommon.protocolhelpers.PebblePacket
++import io.rebble.libpebblecommon.services.VoiceService
++import io.rebble.libpebblecommon.voice.VoiceEncoderInfo
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * Pins Gravel's reading of consnop's patched firmware: the spoken language rides in the session
++ * setup as attribute 0x40, and a change during the recording comes as voice command 0x40. The bytes
++ * are the ones that firmware's test_voice_endpoint expects it to send.
++ */
++internal class VoiceLanguagePacketTest {
++    private fun frame(payload: List<Int>): UByteArray =
++        (listOf(payload.size shr 8, payload.size and 0xff, 0x2a, 0xf8) + payload).map { it.toUByte() }.toUByteArray()
++
++    private val speexAttribute = listOf(0x01, 0x1d, 0x00) + "1.2rc1".map { it.code } + List(14) { 0 } +
++        listOf(0x80, 0x3e, 0x00, 0x00, 0x00, 0x32, 0x04, 0x40, 0x01)
++
++    @Test
++    fun sessionSetupCarriesTheLanguage() {
++        val packet = PebblePacket.deserialize(
++            frame(
++                listOf(0x01, 0, 0, 0, 0, 0x01, 0x07, 0x00, 0x02) + speexAttribute +
++                    listOf(0x40, 0x02, 0x00, 's'.code, 'k'.code),
++            ),
++        )
++        assertIs<SessionSetupCommand>(packet)
++        assertEquals(7u, packet.sessionId.get())
++        assertEquals("sk", VoiceService.languageOf(packet.attributes))
++        assertTrue(VoiceEncoderInfo.fromProtocol(packet.attributes) is VoiceEncoderInfo.Speex)
++    }
++
++    @Test
++    fun aSetupWithoutTheAttributeHasNoLanguage() {
++        val packet = PebblePacket.deserialize(frame(listOf(0x01, 0, 0, 0, 0, 0x01, 0x07, 0x00, 0x01) + speexAttribute))
++        assertIs<SessionSetupCommand>(packet)
++        assertNull(VoiceService.languageOf(packet.attributes))
++    }
++
++    @Test
++    fun languageChangeDecodes() {
++        val packet = PebblePacket.deserialize(
++            frame(listOf(0x40, 0, 0, 0, 0, 0x07, 0x00, 0x01, 0x40, 0x02, 0x00, 'd'.code, 'e'.code)),
++        )
++        assertIs<SessionLanguageCommand>(packet)
++        assertEquals(7u, packet.sessionId.get())
++        assertEquals("de", VoiceService.languageOf(packet.attributes))
++    }
++
++    @Test
++    fun malformedCodesAreIgnored() {
++        for (code in listOf(listOf('e'.code), listOf('e'.code, 'n'.code, 'g'.code), listOf('1'.code, '2'.code), listOf(0xc3, 0xa9))) {
++            val packet = PebblePacket.deserialize(
++                frame(listOf(0x40, 0, 0, 0, 0, 0x07, 0x00, 0x01, 0x40, code.size, 0x00) + code),
++            )
++            assertIs<SessionLanguageCommand>(packet)
++            assertNull(VoiceService.languageOf(packet.attributes), "code $code")
++        }
++    }
++}
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/services/HybridTranscription.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/services/HybridTranscription.kt
+index 78b1f15d..394cc5bb 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/services/HybridTranscription.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/services/HybridTranscription.kt
+@@ -64,11 +64,18 @@ class HybridTranscription(
+         return service.isAvailable()
+     }
+ 
+-    @OptIn(ExperimentalUnsignedTypes::class)
+     override suspend fun transcribe(
+         encoderInfo: VoiceEncoderInfo,
+         audioFrames: Flow<UByteArray>,
+         isNotificationReply: Boolean
++    ): TranscriptionResult = transcribe(encoderInfo, audioFrames, isNotificationReply) { null }
++
++    @OptIn(ExperimentalUnsignedTypes::class)
++    override suspend fun transcribe(
++        encoderInfo: VoiceEncoderInfo,
++        audioFrames: Flow<UByteArray>,
++        isNotificationReply: Boolean,
++        spokenLanguage: () -> String?,
+     ): TranscriptionResult {
+         require(encoderInfo is VoiceEncoderInfo.Speex) {
+             "Local transcription only supports Speex encoding, got ${encoderInfo::class.simpleName}"
+@@ -142,7 +149,10 @@ class HybridTranscription(
+                             bytesRead += bytesToRead
+                         }
+                     }.flowOn(Dispatchers.IO),
+-                    language = STTLanguage.fromCodeOrAutomatic(coreConfigFlow.value.sttConfig.spokenLanguage),
++                    // Gravel: the watch's pick, read now that the recording has ended, wins over the setting.
++                    language = STTLanguage.fromCodeOrAutomatic(
++                        spokenLanguage() ?: coreConfigFlow.value.sttConfig.spokenLanguage,
++                    ),
+                     contentContext = if (isNotificationReply) "Reply to Instant Message" else null,
+                     dictionaryContext = recentContacts,
+                     sampleRate = WATCH_SPEEX_SAMPLE_RATE,
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/services/STTRouter.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/services/STTRouter.kt
+index 0f5275e2..51e41a6f 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/services/STTRouter.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/services/STTRouter.kt
+@@ -51,15 +51,24 @@ class STTRouter(
+         }
+     }
+ 
+-    @OptIn(ExperimentalUnsignedTypes::class)
+     override suspend fun transcribe(
+         encoderInfo: VoiceEncoderInfo,
+         audioFrames: Flow<UByteArray>,
+         isNotificationReply: Boolean
++    ): TranscriptionResult = transcribe(encoderInfo, audioFrames, isNotificationReply) { null }
++
++    // Gravel: the watch's language reaches the hybrid path only; Rebble's ASR and the local
++    // fallback below keep their own language handling.
++    @OptIn(ExperimentalUnsignedTypes::class)
++    override suspend fun transcribe(
++        encoderInfo: VoiceEncoderInfo,
++        audioFrames: Flow<UByteArray>,
++        isNotificationReply: Boolean,
++        spokenLanguage: () -> String?,
+     ): TranscriptionResult {
+         val mode = coreConfigFlow.value.sttConfig.mode
+         if (mode !in rebbleModes) {
+-            return hybrid.transcribe(encoderInfo, audioFrames, isNotificationReply)
++            return hybrid.transcribe(encoderInfo, audioFrames, isNotificationReply, spokenLanguage)
+         }
+ 
+         require(encoderInfo is VoiceEncoderInfo.Speex) {
+-- 
+2.55.0
+
