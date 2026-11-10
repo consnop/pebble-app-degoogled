@@ -157,7 +157,7 @@ jobs:
           {
             echo "Upstream Gravel [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG) with these patches:"
             echo
-            for p in patches/*.patch; do echo "- $(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | head -1)"; done
+            for p in patches/*.patch; do echo "- $(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | sed -n 1p)"; done
             echo
             echo "**Unsigned.** Android won't install this; the signed build is published separately."
             echo
