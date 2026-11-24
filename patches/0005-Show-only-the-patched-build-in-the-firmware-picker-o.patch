@@ -1,7 +1,7 @@
 From 0a4391ef3479abef1c4bf0d726bac7f8e3696b36 Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 15:42:44 +0100
-Subject: [PATCH 5/5] Show only the patched build in the firmware picker on
+Subject: [PATCH 5/6] Show only the patched build in the firmware picker on
  patched boards
 
 The "Choose a PebbleOS build" picker still listed Core's releases through

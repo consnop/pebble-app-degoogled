@@ -1,0 +1,320 @@
+From ddbe9933e75217032ce92e38b0d3432e02f8f869 Mon Sep 17 00:00:00 2001
+From: consnop <consnop@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 11:18:30 +0100
+Subject: [PATCH 6/6] Serve the dev connection on loopback only, startable from
+ adb
+
+The dev connection server bound 0.0.0.0:9000 with no authentication, so
+with "Use LAN developer connection" on, anyone on the same Wi-Fi could
+install apps and talk to the watch. On a public network that meant
+turning Wi-Fi off and going over USB to develop at all.
+
+It now binds 127.0.0.1. A computer reaches it through adb (USB or
+wireless debugging, both of which authenticate the computer) with
+`adb forward tcp:9000 tcp:9000`. Release builds keep upstream's
+DUMP-gated DevConnectionReceiver so the computer can also start the
+server over adb; the other three QA receivers stay removed.
+
+The watch menu no longer lists the phone's network addresses, which
+cannot reach the server anymore. That listing is what closed the app
+where the UDP filter is installed (NetworkInterface.getNetworkInterfaces()
+returning null), so the KNOWN_ISSUES entry goes. A jvm test fails if the
+server becomes reachable on a non-loopback address.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ DESIGN_NOTES.md                               | 14 +++--
+ KNOWN_ISSUES.md                               | 20 ------
+ androidApp/build.gradle.kts                   |  1 +
+ androidApp/src/release/AndroidManifest.xml    | 21 +++----
+ .../devconnection/DevConnectionLANServer.kt   |  7 ++-
+ .../devconnection/DevConnectionServerTest.kt  | 61 +++++++++++++++++++
+ .../pebble/ui/WatchSettingsScreen.kt          |  4 +-
+ .../coredevices/pebble/ui/WatchesScreen.kt    | 37 ++++-------
+ 8 files changed, 101 insertions(+), 64 deletions(-)
+ create mode 100644 libpebble3/src/jvmTest/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionServerTest.kt
+
+diff --git a/DESIGN_NOTES.md b/DESIGN_NOTES.md
+index a735b7d8..cd0f4b2b 100644
+--- a/DESIGN_NOTES.md
++++ b/DESIGN_NOTES.md
+@@ -21,12 +21,16 @@ The same idea applies to the manifest. Upstream declares four adb-driven
+ QA receivers (settings write, dev connection server, QEMU watch attach,
+ firmware sideload; all gated on `android.permission.DUMP`, which only
+ the system, privileged apps, and the adb shell can hold) for every build
+-type. Gravel keeps them out of release with
++type. Gravel keeps three of them out of release with
+ `androidApp/src/release/AndroidManifest.xml`, a release-only overlay
+-whose `tools:node="remove"` entries drop the four elements from the
+-merged manifest; upstream's declarations and classes stay verbatim,
+-debug builds keep the receivers for driving an emulator from adb, and
+-the release exported-component allowlist is unchanged. Gravel adds one
++whose `tools:node="remove"` entries drop those elements from the
++merged manifest; upstream's declarations and classes stay verbatim and
++debug builds keep all four for driving an emulator from adb. The dev
++connection receiver ships in release and is on the exported-component
++allowlist: Gravel's dev connection server listens on 127.0.0.1 only, so
++adb (USB or wireless debugging, both of which authenticate the computer)
++is the way a computer starts it and reaches it
++(`adb forward tcp:9000 tcp:9000`). Gravel adds one
+ receiver of the same kind, declared only in the debug overlay
+ `androidApp/src/debug/AndroidManifest.xml`: `SttDebugReceiver`, gated on
+ the same permission, sets the four dictation debug hooks and the local
+diff --git a/KNOWN_ISSUES.md b/KNOWN_ISSUES.md
+index fa0ee785..6a0b4f39 100644
+--- a/KNOWN_ISSUES.md
++++ b/KNOWN_ISSUES.md
+@@ -438,26 +438,6 @@ one of the types that `VerifyApkContents` lists, three Java UDP socket
+ types and `DatagramPacket`, which opens no socket; an app bundle build does
+ not run that check.
+ 
+-## The Dev Connection switch closes the app with the LAN setting on
+-
+-**Status: deferred; to be fixed on its own branch.**
+-
+-Where the UDP filter is installed, turning on Dev Connection in a watch's
+-menu while "Use LAN developer connection" (Settings > Connectivity) is on
+-closes Gravel. The menu lists the phone's network interfaces to show its
+-addresses, and `NetworkInterface.getNetworkInterfaces()` returned null in
+-Gravel's process, which the menu does not handle. By the platform's source
+-that is the filter's effect: Android looks up each interface's index
+-through an IPv4 datagram socket, which the filter refuses, and leaves out
+-an interface it gets no index for (`android17-release`: bionic
+-`libc/bionic/net_if.cpp`, `if_nametoindex`; libcore
+-`ojluni/src/main/java/java/net/NetworkInterface.java`, `getAll` and
+-`getNetworkInterfaces`). Seen once, on a Pixel running GrapheneOS (Android
+-17) with a development build and the filter installed. Not tried: a
+-released build (0.3.1 and 0.3.3 have the same menu code and install the
+-filter), and a build or phone without the filter. This entry leaves the
+-file when the fix lands.
+-
+ ## The UDP filter starts with the app process, not before it
+ 
+ **Status: accepted.**
+diff --git a/androidApp/build.gradle.kts b/androidApp/build.gradle.kts
+index cdf2fd37..19c8a215 100644
+--- a/androidApp/build.gradle.kts
++++ b/androidApp/build.gradle.kts
+@@ -252,6 +252,7 @@ val allowedExportedComponents = setOf(
+     "service|androidx.work.impl.background.systemjob.SystemJobService|perm=android.permission.BIND_JOB_SERVICE|read=|write=",
+     "receiver|androidx.work.impl.diagnostics.DiagnosticsReceiver|perm=android.permission.DUMP|read=|write=",
+     "receiver|androidx.profileinstaller.ProfileInstallReceiver|perm=android.permission.DUMP|read=|write=",
++    "receiver|coredevices.coreapp.debug.DevConnectionReceiver|perm=android.permission.DUMP|read=|write=",
+     "provider|io.rebble.libpebblecommon.pebblekit.two.PebbleKitProvider|perm=|read=|write=",
+     "provider|io.rebble.libpebblecommon.pebblekit.classic.PebbleKitProvider|perm=|read=|write=",
+ )
+diff --git a/androidApp/src/release/AndroidManifest.xml b/androidApp/src/release/AndroidManifest.xml
+index a4df6517..4088e364 100644
+--- a/androidApp/src/release/AndroidManifest.xml
++++ b/androidApp/src/release/AndroidManifest.xml
+@@ -4,18 +4,20 @@
+     builds on top of src/main and every library manifest, and each
+     tools:node="remove" below deletes that element from the merged result.
+ 
+-    Upstream declares these four broadcast receivers for every build as
+-    adb-driven QA tooling: write a persisted setting, start the LAN dev
++    Upstream declares four broadcast receivers for every build as
++    adb-driven QA tooling: write a persisted setting, start the dev
+     connection server, attach a QEMU emulator as a watch, and sideload a
+     firmware file. Each is gated on android.permission.DUMP, which only the
+     system, privileged apps, and the adb shell can hold, so no installed
+-    app can reach them. The fork still keeps them out of release: a
++    app can reach them. The fork keeps three of them out of release: a
+     shipping build carries no settings-write or firmware-sideload hook
+-    at all, and the release exported-component allowlist stays exactly
+-    what it was. Debug builds keep the receivers as upstream documents
+-    them, so an emulator can be driven from adb; the "safe to keep in
+-    release builds" wording in upstream's manifest comment and receiver
+-    KDocs describes upstream's build, not this one.
++    at all. DevConnectionReceiver stays, because the dev connection server
++    listens on loopback only and adb is how a computer starts and reaches
++    it; it is on the release exported-component allowlist. Debug builds
++    keep all four receivers as upstream documents them, so an emulator can
++    be driven from adb; the "safe to keep in release builds" wording in
++    upstream's manifest comment and the other receivers' KDocs describes
++    upstream's build, not this one.
+ 
+     Removing here, rather than editing upstream's declarations, keeps
+     upstream's manifests and classes verbatim; R8 drops the classes from
+@@ -29,9 +31,6 @@
+         <receiver
+             android:name="coredevices.coreapp.debug.QemuSetupReceiver"
+             tools:node="remove" />
+-        <receiver
+-            android:name="coredevices.coreapp.debug.DevConnectionReceiver"
+-            tools:node="remove" />
+         <receiver
+             android:name="coredevices.coreapp.debug.SetSettingReceiver"
+             tools:node="remove" />
+diff --git a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionLANServer.kt b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionLANServer.kt
+index 149a0fb6..ffe62c9d 100644
+--- a/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionLANServer.kt
++++ b/libpebble3/src/commonMain/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionLANServer.kt
+@@ -51,6 +51,7 @@ import kotlinx.io.files.SystemFileSystem
+ class DevConnectionServer(libPebble: LibPebble): DevConnectionTransport(libPebble) {
+     companion object {
+         const val PORT = 9000
++        const val LISTEN_HOST = "127.0.0.1"
+         private val logger = Logger.withTag("DevConnectionServer")
+     }
+     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+@@ -140,7 +141,9 @@ class DevConnectionServer(libPebble: LibPebble): DevConnectionTransport(libPebbl
+         // duplicate server that fails to bind. Start once and suspend until stop()/cancellation.
+         val newServer = embeddedServer(CIO, rootConfig) {
+             connectors.add(EngineConnectorBuilder().apply {
+-                host = "0.0.0.0"
++                // Gravel: loopback only, because the server has no authentication. A computer
++                // reaches it through adb (USB or wireless debugging): `adb forward tcp:9000 tcp:9000`.
++                host = LISTEN_HOST
+                 port = PORT
+             })
+             connectionGroupSize = 1
+@@ -149,7 +152,7 @@ class DevConnectionServer(libPebble: LibPebble): DevConnectionTransport(libPebbl
+         }
+         server = newServer
+         newServer.start()
+-        logger.i { "Dev connection server listening on port $PORT" }
++        logger.i { "Dev connection server listening on $LISTEN_HOST:$PORT" }
+         awaitCancellation()
+     }
+ 
+diff --git a/libpebble3/src/jvmTest/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionServerTest.kt b/libpebble3/src/jvmTest/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionServerTest.kt
+new file mode 100644
+index 00000000..acbd263b
+--- /dev/null
++++ b/libpebble3/src/jvmTest/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionServerTest.kt
+@@ -0,0 +1,61 @@
++package io.rebble.libpebblecommon.connection.devconnection
++
++import io.rebble.libpebblecommon.connection.FakeLibPebble
++import io.rebble.libpebblecommon.connection.PebbleSocketIdentifier
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.emptyFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeout
++import java.net.ConnectException
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.net.NetworkInterface
++import java.net.Socket
++import kotlin.test.Test
++import kotlin.test.assertFailsWith
++import kotlin.test.assertTrue
++
++/**
++ * Gravel serves the dev connection on loopback only (it has no authentication); an upstream
++ * sync that puts back a wildcard bind fails here.
++ */
++class DevConnectionServerTest {
++    private fun canConnect(address: InetAddress): Boolean = try {
++        Socket().use { it.connect(InetSocketAddress(address, DevConnectionServer.PORT), 500) }
++        true
++    } catch (e: ConnectException) {
++        false
++    }
++
++    @Test
++    fun listensOnLoopbackOnly() = runBlocking {
++        val server = DevConnectionServer(FakeLibPebble())
++        val job = launch(Dispatchers.IO) {
++            server.start(PebbleSocketIdentifier("test"), emptyFlow(), emptyFlow()) {}
++        }
++        try {
++            val loopback = InetAddress.getByName(DevConnectionServer.LISTEN_HOST)
++            withTimeout(10_000) {
++                while (!canConnect(loopback)) delay(100)
++            }
++
++            val external = NetworkInterface.getNetworkInterfaces().asSequence()
++                .filter { it.isUp && !it.isLoopback }
++                .flatMap { it.inetAddresses.asSequence() }
++                .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
++                .toList()
++            for (address in external) {
++                assertFailsWith<ConnectException>("reachable on $address") {
++                    Socket().use { it.connect(InetSocketAddress(address, DevConnectionServer.PORT), 500) }
++                }
++            }
++            assertTrue(loopback.isLoopbackAddress)
++        } finally {
++            job.cancelAndJoin()
++            server.stop()
++        }
++    }
++}
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt
+index a3625047..4b902dea 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt
+@@ -1853,8 +1853,8 @@ fun rememberSettingsItemsState(navBarNav: NavBarNav?, snackbarDisplay: SnackbarD
+                     show = { true }
+                 ) },
+                 basicSettingsToggleItem(
+-                    title = "Use LAN developer connection",
+-                    description = "Allow connecting to developer connection over LAN, this is not secure and should only be used on trusted networks",
++                    title = "Use local developer connection",
++                    description = "Serve the developer connection on this phone only (127.0.0.1:9000), for a computer connected over adb (USB or wireless debugging). Nothing on the network can reach it",
+                     topLevelType = TopLevelType.Phone,
+                     section = Section.Connectivity,
+                     checked = libPebbleConfig.watchConfig.lanDevConnection,
+diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt
+index 8837b65b..ed6c032f 100644
+--- a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt
++++ b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt
+@@ -179,6 +179,7 @@ import io.rebble.libpebblecommon.connection.PebbleDevice
+ import io.rebble.libpebblecommon.connection.bt.BluetoothState
+ import io.rebble.libpebblecommon.connection.bt.ble.pebble.ReversePpogVersion
+ import io.rebble.libpebblecommon.connection.color
++import io.rebble.libpebblecommon.connection.devconnection.DevConnectionServer
+ import io.rebble.libpebblecommon.connection.endpointmanager.FirmwareUpdateErrorStarting
+ import io.rebble.libpebblecommon.connection.endpointmanager.FirmwareUpdater
+ import io.rebble.libpebblecommon.connection.endpointmanager.LanguagePackInstallState
+@@ -1478,30 +1479,18 @@ fun WatchMenu(watch: PebbleDevice, navBarNav: NavBarNav) {
+ 
+                 if (active) {
+                     if (config.watchConfig.lanDevConnection) {
+-                        val (v4, v6) = remember { getIPAddress() }
+-                        v4?.let {
+-                            Box(
+-                                modifier = Modifier
+-                                    .padding(horizontal = 12.dp, vertical = 12.dp)
+-                                    .fillMaxWidth()
+-                            ) {
+-                                Text(
+-                                    text = "IPv4: $v4",
+-                                    style = MaterialTheme.typography.labelMedium,
+-                                )
+-                            }
+-                        }
+-                        v6?.let {
+-                            Box(
+-                                modifier = Modifier
+-                                    .padding(horizontal = 12.dp, vertical = 12.dp)
+-                                    .fillMaxWidth()
+-                            ) {
+-                                Text(
+-                                    text = "IPv6: $v6",
+-                                    style = MaterialTheme.typography.labelMedium,
+-                                )
+-                            }
++                        // Gravel: the server listens on loopback only, so the phone's network
++                        // addresses would not reach it; a computer comes in through adb.
++                        Box(
++                            modifier = Modifier
++                                .padding(horizontal = 12.dp, vertical = 12.dp)
++                                .fillMaxWidth()
++                        ) {
++                            Text(
++                                text = "On this phone only (127.0.0.1:${DevConnectionServer.PORT}). " +
++                                    "Reach it over adb: adb forward tcp:${DevConnectionServer.PORT} tcp:${DevConnectionServer.PORT}",
++                                style = MaterialTheme.typography.labelMedium,
++                            )
+                         }
+                     } else {
+                         Box(
+-- 
+2.55.0
+

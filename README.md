@@ -15,7 +15,12 @@ If the patches stop applying, the run fails and opens an issue here.
 ## Current patches
 
 - `0001`: the four new two-button Quick Launch combos in Gravel's watch settings, for
-  [consnop/PebbleOS](https://github.com/consnop/PebbleOS) firmware. Developed on the `combos` branch.
+  [consnop/PebbleOS](https://github.com/consnop/PebbleOS) firmware.
+- `0002`, `0003`, `0005`: obelix_pvt watches get firmware updates from consnop/PebbleOS releases
+  (its `firmware-feed.json`), and the firmware picker offers only that build.
+- `0004`: dictation is transcribed in the language picked on the watch.
+- `0006`: the dev connection server listens on 127.0.0.1 only and can be started over adb, so it is
+  never exposed on Wi-Fi; reach it with `adb forward tcp:9000 tcp:9000` (USB or wireless debugging).
 
 ## Changing the patches
 
