@@ -1,4 +1,4 @@
-From ddbe9933e75217032ce92e38b0d3432e02f8f869 Mon Sep 17 00:00:00 2001
+From e9beaa1678c4fceff183502cd247018346779f72 Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 11:18:30 +0100
 Subject: [PATCH 6/6] Serve the dev connection on loopback only, startable from
@@ -35,7 +35,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 libpebble3/src/jvmTest/kotlin/io/rebble/libpebblecommon/connection/devconnection/DevConnectionServerTest.kt
 
 diff --git a/DESIGN_NOTES.md b/DESIGN_NOTES.md
-index a735b7d8..cd0f4b2b 100644
+index e0025a76..79d80ff0 100644
 --- a/DESIGN_NOTES.md
 +++ b/DESIGN_NOTES.md
 @@ -21,12 +21,16 @@ The same idea applies to the manifest. Upstream declares four adb-driven
@@ -48,7 +48,7 @@ index a735b7d8..cd0f4b2b 100644
 -whose `tools:node="remove"` entries drop the four elements from the
 -merged manifest; upstream's declarations and classes stay verbatim,
 -debug builds keep the receivers for driving an emulator from adb, and
--the release exported-component allowlist is unchanged. Gravel adds one
+-the release exported-component allowlist is unchanged. Gravel adds two
 +whose `tools:node="remove"` entries drop those elements from the
 +merged manifest; upstream's declarations and classes stay verbatim and
 +debug builds keep all four for driving an emulator from adb. The dev
@@ -56,12 +56,12 @@ index a735b7d8..cd0f4b2b 100644
 +allowlist: Gravel's dev connection server listens on 127.0.0.1 only, so
 +adb (USB or wireless debugging, both of which authenticate the computer)
 +is the way a computer starts it and reaches it
-+(`adb forward tcp:9000 tcp:9000`). Gravel adds one
- receiver of the same kind, declared only in the debug overlay
- `androidApp/src/debug/AndroidManifest.xml`: `SttDebugReceiver`, gated on
- the same permission, sets the four dictation debug hooks and the local
++(`adb forward tcp:9000 tcp:9000`). Gravel adds two
+ receivers of the same kind, declared only in the debug overlay
+ `androidApp/src/debug/AndroidManifest.xml` and gated on the same
+ permission: `SttDebugReceiver` sets the four dictation debug hooks and the
 diff --git a/KNOWN_ISSUES.md b/KNOWN_ISSUES.md
-index fa0ee785..6a0b4f39 100644
+index f3568652..2d1beee4 100644
 --- a/KNOWN_ISSUES.md
 +++ b/KNOWN_ISSUES.md
 @@ -438,26 +438,6 @@ one of the types that `VerifyApkContents` lists, three Java UDP socket
@@ -92,10 +92,10 @@ index fa0ee785..6a0b4f39 100644
  
  **Status: accepted.**
 diff --git a/androidApp/build.gradle.kts b/androidApp/build.gradle.kts
-index cdf2fd37..19c8a215 100644
+index 83375fa4..6c5dbb00 100644
 --- a/androidApp/build.gradle.kts
 +++ b/androidApp/build.gradle.kts
-@@ -252,6 +252,7 @@ val allowedExportedComponents = setOf(
+@@ -256,6 +256,7 @@ val allowedExportedComponents = setOf(
      "service|androidx.work.impl.background.systemjob.SystemJobService|perm=android.permission.BIND_JOB_SERVICE|read=|write=",
      "receiver|androidx.work.impl.diagnostics.DiagnosticsReceiver|perm=android.permission.DUMP|read=|write=",
      "receiver|androidx.profileinstaller.ProfileInstallReceiver|perm=android.permission.DUMP|read=|write=",
@@ -246,10 +246,10 @@ index 00000000..acbd263b
 +    }
 +}
 diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt
-index a3625047..4b902dea 100644
+index 31b6ba6e..b63b9a30 100644
 --- a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt
 +++ b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchSettingsScreen.kt
-@@ -1853,8 +1853,8 @@ fun rememberSettingsItemsState(navBarNav: NavBarNav?, snackbarDisplay: SnackbarD
+@@ -1857,8 +1857,8 @@ fun rememberSettingsItemsState(navBarNav: NavBarNav?, snackbarDisplay: SnackbarD
                      show = { true }
                  ) },
                  basicSettingsToggleItem(
@@ -261,10 +261,10 @@ index a3625047..4b902dea 100644
                      section = Section.Connectivity,
                      checked = libPebbleConfig.watchConfig.lanDevConnection,
 diff --git a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt
-index 8837b65b..ed6c032f 100644
+index 208b22b6..dc07fa95 100644
 --- a/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt
 +++ b/pebble/src/commonMain/kotlin/coredevices/pebble/ui/WatchesScreen.kt
-@@ -179,6 +179,7 @@ import io.rebble.libpebblecommon.connection.PebbleDevice
+@@ -180,6 +180,7 @@ import io.rebble.libpebblecommon.connection.PebbleDevice
  import io.rebble.libpebblecommon.connection.bt.BluetoothState
  import io.rebble.libpebblecommon.connection.bt.ble.pebble.ReversePpogVersion
  import io.rebble.libpebblecommon.connection.color
@@ -272,7 +272,7 @@ index 8837b65b..ed6c032f 100644
  import io.rebble.libpebblecommon.connection.endpointmanager.FirmwareUpdateErrorStarting
  import io.rebble.libpebblecommon.connection.endpointmanager.FirmwareUpdater
  import io.rebble.libpebblecommon.connection.endpointmanager.LanguagePackInstallState
-@@ -1478,30 +1479,18 @@ fun WatchMenu(watch: PebbleDevice, navBarNav: NavBarNav) {
+@@ -1484,30 +1485,18 @@ fun WatchMenu(watch: PebbleDevice, navBarNav: NavBarNav) {
  
                  if (active) {
                      if (config.watchConfig.lanDevConnection) {

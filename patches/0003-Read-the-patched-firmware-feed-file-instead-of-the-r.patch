@@ -1,4 +1,4 @@
-From 5c0fb940a6ea105d9fb6a39eba8959826631216e Mon Sep 17 00:00:00 2001
+From d04695e1de8a310e17d7836b1afbb4f7c929c35b Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 15:01:19 +0100
 Subject: [PATCH 3/6] Read the patched firmware feed file instead of the

@@ -1,4 +1,4 @@
-From 0ec06e1b0273f75b694912aca80e9c0b763d2a23 Mon Sep 17 00:00:00 2001
+From de0974c0daec33a1ad457e6db5739ed4026fc2b6 Mon Sep 17 00:00:00 2001
 From: consnop <consnop@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 22:22:15 +0100
 Subject: [PATCH 2/6] Offer consnop's patched firmware to boards it builds for
